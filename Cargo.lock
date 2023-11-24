@@ -1745,6 +1745,7 @@ name = "stitch_pictures"
 version = "0.1.0"
 dependencies = [
  "image",
+ "indicatif",
  "slippy-map-tiles",
 ]
 

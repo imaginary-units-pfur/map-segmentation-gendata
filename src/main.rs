@@ -127,28 +127,48 @@ impl From<GeoCoordinate> for Coord<f64> {
     }
 }
 
+const COLOR_INDEX: &[[u8; 3]] = &[[0, 0, 0], [255, 0, 0], [0, 255, 0]];
+
+#[derive(Clone, Copy, Debug)]
+enum BuildingColor {
+    Nothing = 0,
+    BuildingBelowAreaThreshold = 1,
+    Normal = 2,
+    BuildingHasExcludedTags = 3,
+}
+
 #[derive(Default)]
 struct ImageCache {
-    tiles: HashMap<Tile, DynamicImage>,
+    tiles: HashMap<Tile, ()>,
     outlines: HashMap<Tile, ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
     dirty: HashSet<Tile>,
+    client: reqwest::blocking::Client,
 }
 
 impl ImageCache {
     pub fn prepare_tile(&mut self, tile: Tile) -> anyhow::Result<()> {
-        let interest_center = (54.6961, 20.5120);
-        let interest_zoom = ZOOM - 4; // 4096 area
-        let interest_megatile =
-            slippy_map_tiles::lat_lon_to_tile(interest_center.0, interest_center.1, interest_zoom);
-        let interest_megatile =
-            Tile::new(interest_zoom, interest_megatile.0, interest_megatile.1).unwrap();
+        // let interest_center = (54.6961, 20.5120);
+        // let interest_zoom = ZOOM - 4; // 4096 area
+
+        // let interest_megatile =
+        //     slippy_map_tiles::lat_lon_to_tile(interest_center.0, interest_center.1, interest_zoom);
+        // let interest_megatile =
+        //     Tile::new(interest_zoom, interest_megatile.0, interest_megatile.1).unwrap();
+
+        // entire moscow
+        let buf = 0.5;
+        let interest_bbox = slippy_map_tiles::BBox::new(55.93+buf, 37.3-buf, 55.56-buf, 37.9+buf).unwrap();
+
+        // inside TTK
+        // let interest_bbox = slippy_map_tiles::BBox::new(55.79, 37.53, 55.70, 37.7).unwrap();
 
         let do_download = {
-            let mut t = tile;
-            while t.zoom() > interest_megatile.zoom() {
-                t = t.parent().unwrap();
-            }
-            t == interest_megatile
+            interest_bbox.overlaps_bbox(&tile.bbox())
+            // let mut t = tile;
+            // while t.zoom() > interest_megatile.zoom() {
+            //     t = t.parent().unwrap();
+            // }
+            // t == interest_megatile
         };
 
         if self.tiles.get(&tile).is_none() && !do_download {
@@ -166,7 +186,10 @@ impl ImageCache {
         let path = format!("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{}/{}/{}", tile.zoom(), tile.y(), tile.x());
         //let path = format!("https://core-sat.maps.yandex.net/tiles?l=sat&v=3.1124.0&x={}&y={}&z={}&scale=1&lang=ru_RU&client_id=yandex-web-maps", tile.x(), tile.y(), tile.zoom());
 
-        let tiledata = reqwest::blocking::get(path)
+        let tiledata = self
+            .client
+            .get(path)
+            .send()
             .unwrap()
             .bytes()
             .unwrap()
@@ -178,7 +201,11 @@ impl ImageCache {
             .unwrap();
         let outline_img: ImageBuffer<image::Rgb<u8>, Vec<_>> =
             ImageBuffer::new(tileimg.width(), tileimg.height());
-        self.tiles.insert(tile, tileimg);
+
+        tileimg
+            .save(format!("tiles/{}-{}.jpg", tile.y(), tile.x()))
+            .unwrap();
+        self.tiles.insert(tile, ());
         self.outlines.insert(tile, outline_img);
 
         Ok(())
@@ -191,10 +218,8 @@ impl ImageCache {
     ) -> Point<i32> {
         let top_lat = tile.top() as f64;
         let bot_lat = tile.bottom() as f64;
-        // let (min_lat, max_lat) = (min_lat.min(max_lat), max_lat.max(min_lat));
         let left_lon = tile.left() as f64;
         let right_lon = tile.right() as f64;
-        // let (min_lon, max_lon) = (min_lon.min(max_lon), max_lon.max(min_lon));
 
         let x = translate(
             coord.longitude,
@@ -211,7 +236,11 @@ impl ImageCache {
         Point::new(x, y)
     }
 
-    pub fn draw_polygon(&mut self, poly: &[GeoCoordinate]) -> anyhow::Result<()> {
+    pub fn draw_polygon(
+        &mut self,
+        poly: &[GeoCoordinate],
+        how: BuildingColor,
+    ) -> anyhow::Result<()> {
         info!("Drawing polygon {poly:?}");
 
         let tiles: HashSet<_> = poly
@@ -240,7 +269,7 @@ impl ImageCache {
             imageproc::drawing::draw_polygon_mut(
                 img,
                 &tile_relative_poly,
-                image::Rgb([0u8, 255, 0]),
+                image::Rgb(COLOR_INDEX[how as usize]),
             );
         }
 
@@ -249,10 +278,10 @@ impl ImageCache {
 
     pub fn save(&mut self) {
         warn!("Saving image cache...");
-        for (tile, img) in self.tiles.iter().filter(|v| self.dirty.contains(v.0)) {
-            img.save(format!("tiles/{}-{}.jpg", tile.y(), tile.x()))
-                .unwrap();
-        }
+        // for (tile, img) in self.tiles.iter().filter(|v| self.dirty.contains(v.0)) {
+        //     img.save(format!("tiles/{}-{}.jpg", tile.y(), tile.x()))
+        //         .unwrap();
+        // }
         for (tile, img) in self.outlines.iter().filter(|v| self.dirty.contains(v.0)) {
             img.save(format!("outlines/{}-{}.png", tile.y(), tile.x()))
                 .unwrap();
@@ -268,15 +297,15 @@ impl ImageCache {
             let name = name.unwrap();
             let name = name.file_name();
             let name = name.to_string_lossy();
-            let img = image::io::Reader::open(format!("tiles/{name}"))
-                .unwrap()
-                .decode()
-                .unwrap();
+            // let img = image::io::Reader::open(format!("tiles/{name}"))
+            //     .unwrap()
+            //     .decode()
+            //     .unwrap();
             let mut parts = name.strip_suffix(".jpg").unwrap().split("-");
             let y = parts.next().unwrap().parse().unwrap();
             let x = parts.next().unwrap().parse().unwrap();
             let tile = Tile::new(ZOOM, x, y).unwrap();
-            cache.tiles.insert(tile, img);
+            cache.tiles.insert(tile, ());
         }
         for name in std::fs::read_dir("outlines").unwrap() {
             let name = name.unwrap();
@@ -333,11 +362,10 @@ fn fetch_outline_way(
     let area = geo_poly.geodesic_area_signed().abs();
     info!("Area: {area} m^2");
     if area < 100.0 {
-        info!("Area too small, ignoring");
-        return Ok(());
+        cache.draw_polygon(&coords, BuildingColor::BuildingBelowAreaThreshold)?;
+    } else {
+        cache.draw_polygon(&coords, BuildingColor::Normal)?;
     }
-
-    cache.draw_polygon(&coords)?;
     Ok(())
 }
 
@@ -407,7 +435,15 @@ fn build_outlines(filename: &std::ffi::OsStr) {
         )
         .unwrap(),
     ) {
-        info!("{way:?}");
+        let mut interest_tags = String::new();
+        for tag in way.1.tags.iter() {
+            if tag.0.starts_with("building") {
+                let part = format!("{}={}; ", tag.0, tag.1);
+                interest_tags.extend(part.chars());
+            }
+        }
+        // info!("{way:?}");
+        // println!("{interest_tags}");
         idx += 1;
         if let Err(why) = fetch_outline_way(&mut cache, way.1, &nodes_all) {
             info!("error fetching outline: {why}")
@@ -428,8 +464,8 @@ fn build_outlines(filename: &std::ffi::OsStr) {
 fn main() {
     env_logger::init();
     let file =
-        //&OsString::from_str("/home/danya/Downloads/central-fed-district-latest.osm.pbf").unwrap();
-        &OsString::from_str("/home/danya/Downloads/kaliningrad-latest.osm.pbf").unwrap();
+        &OsString::from_str("/home/danya/Downloads/central-fed-district-latest.osm.pbf").unwrap();
+    //        &OsString::from_str("/home/danya/Downloads/kaliningrad-latest.osm.pbf").unwrap();
     // fetch_buildings(&file);
     build_outlines(&file);
 }

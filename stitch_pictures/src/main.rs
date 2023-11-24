@@ -1,59 +1,32 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
-use image::{DynamicImage, ImageBuffer, RgbImage};
+use image::{DynamicImage, RgbImage};
+use indicatif::{ProgressIterator, ProgressStyle};
 use slippy_map_tiles::Tile;
-
-#[derive(Default)]
-struct ImageCache {
-    tiles: HashMap<Tile, DynamicImage>,
-    outlines: HashMap<Tile, ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
-}
 
 const ZOOM: u8 = 17; // zoom where 1px=1m;
 
-impl ImageCache {
-    fn load() -> Self {
-        let mut cache = ImageCache::default();
-        for name in std::fs::read_dir("../tiles").unwrap() {
-            let name = name.unwrap();
-            let name = name.file_name();
-            let name = name.to_string_lossy();
-            let img = image::io::Reader::open(format!("../tiles/{name}"))
-                .unwrap()
-                .decode()
-                .unwrap();
-            let mut parts = name.strip_suffix(".jpg").unwrap().split("-");
-            let y = parts.next().unwrap().parse().unwrap();
-            let x = parts.next().unwrap().parse().unwrap();
-            let tile = Tile::new(ZOOM, x, y).unwrap();
-            cache.tiles.insert(tile, img);
-        }
-        for name in std::fs::read_dir("../outlines").unwrap() {
-            let name = name.unwrap();
-            let name = name.file_name();
-            let name = name.to_string_lossy();
-            let img = image::io::Reader::open(format!("../outlines/{name}"))
-                .unwrap()
-                .decode()
-                .unwrap();
-            let mut parts = name.strip_suffix(".png").unwrap().split("-");
-            let y = parts.next().unwrap().parse().unwrap();
-            let x = parts.next().unwrap().parse().unwrap();
-            let tile = Tile::new(ZOOM, x, y).unwrap();
-            cache.outlines.insert(tile, img.into_rgb8());
-        }
-
-        cache
-    }
+fn get_tile(t: Tile) -> Option<DynamicImage> {
+    image::io::Reader::open(format!("../tiles/{}-{}.jpg", t.y(), t.x()))
+        .ok()?
+        .decode()
+        .ok()
 }
 
-fn build_tile_img(cache: &ImageCache, tile: (&Tile, &DynamicImage)) {
-    let mut target_tile = RgbImage::new(tile.1.width() * 4, tile.1.height() * 4);
-    let mut target_outline = RgbImage::new(tile.1.width() * 4, tile.1.height() * 4);
-    for x in 0..4 {
-        for y in 0..4 {
-            let t = Tile::new(ZOOM, tile.0.x() + x, tile.0.y() + y).unwrap();
-            match cache.tiles.get(&t) {
+fn get_outline(t: Tile) -> Option<DynamicImage> {
+    image::io::Reader::open(format!("../outlines/{}-{}.png", t.y(), t.x()))
+        .ok()?
+        .decode()
+        .ok()
+}
+
+fn build_tile_img(tile: &Tile) {
+    let mut target_tile = RgbImage::new(256 * 8, 256 * 8);
+    let mut target_outline = RgbImage::new(256 * 8, 256 * 8);
+    for x in 0..8 {
+        for y in 0..8 {
+            let t = Tile::new(ZOOM, tile.x() + x, tile.y() + y).unwrap();
+            match get_tile(t) {
                 Some(img) => {
                     image::imageops::overlay(
                         &mut target_tile,
@@ -65,11 +38,11 @@ fn build_tile_img(cache: &ImageCache, tile: (&Tile, &DynamicImage)) {
                 None => return,
             };
 
-            match cache.outlines.get(&t) {
+            match get_outline(t) {
                 Some(img) => {
                     image::imageops::overlay(
                         &mut target_outline,
-                        img,
+                        &img.clone().into_rgb8(),
                         img.width() as i64 * x as i64,
                         img.height() as i64 * y as i64,
                     );
@@ -80,26 +53,46 @@ fn build_tile_img(cache: &ImageCache, tile: (&Tile, &DynamicImage)) {
     }
 
     target_tile
-        .save(format!(
-            "../stitched/tiles/{}-{}.jpg",
-            tile.0.y(),
-            tile.0.x()
-        ))
+        .save(format!("../stitched/tiles/{}-{}.jpg", tile.y(), tile.x()))
         .unwrap();
     target_outline
         .save(format!(
             "../stitched/outlines/{}-{}.png",
-            tile.0.y(),
-            tile.0.x()
+            tile.y(),
+            tile.x()
         ))
         .unwrap();
 }
 
 fn main() {
-    let cache = ImageCache::load();
+    let mut tiles_touched = HashSet::new();
 
-    for tile in cache.tiles.iter() {
-        println!("{:?}", tile.0);
-        build_tile_img(&cache, tile);
+    let mut files = std::fs::read_dir("../tiles")
+        .unwrap()
+        .map(|v| v.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    files.sort();
+    for name in files.into_iter()
+        .progress_with_style(ProgressStyle::with_template(
+            "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
+        )
+        .unwrap())
+    {
+        // let img = image::io::Reader::open(format!("tiles/{name}"))
+        //     .unwrap()
+        //     .decode()
+        //     .unwrap();
+        let mut parts = name.strip_suffix(".jpg").unwrap().split("-");
+        let y = parts.next().unwrap().parse().unwrap();
+        let x = parts.next().unwrap().parse().unwrap();
+        let tile = Tile::new(ZOOM, x, y).unwrap();
+        if !tiles_touched.contains(&tile) {
+            build_tile_img(&tile);
+            for dx in 0..8 {
+                for dy in 0..8 {
+                    tiles_touched.insert(Tile::new(ZOOM, x + dx, y + dy).unwrap());
+                }
+            }
+        }
     }
 }
