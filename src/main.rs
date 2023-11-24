@@ -1,16 +1,17 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io::{BufReader, BufWriter, Cursor},
     str::FromStr,
 };
 
 use geo::{Coord, GeodesicArea, LineString, Polygon};
-use image::ImageBuffer;
+use image::{DynamicImage, ImageBuffer};
 use imageproc::point::Point;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
+use log::{debug, info, warn};
 use osmpbfreader::{Node, Relation, Way};
-use slippy_map_tiles::LatLon;
+use slippy_map_tiles::{LatLon, Tile};
 
 struct ProgressFile<R: std::io::Read> {
     inner: R,
@@ -81,144 +82,283 @@ fn fetch_buildings(filename: &std::ffi::OsStr) {
 const ZOOM: u8 = 17; // zoom where 1px=1m;
 
 fn translate(value: f64, left_min: f64, left_max: f64, right_min: f64, right_max: f64) -> f64 {
+    log::trace!("translate({value}, {left_min}, {left_max}, {right_min}, {right_max}");
     let left_span = left_max - left_min;
     let right_span = right_max - right_min;
 
     let value_scaled = (value - left_min) / left_span;
 
-    right_min + (value_scaled * right_span)
+    let out = right_min + (value_scaled * right_span);
+
+    log::trace!("translate({value}, {left_min}, {left_max}, {right_min}, {right_max}) -> {out}");
+    out
 }
 
-fn fetch_outline_way(way: &Way, nodes: &HashMap<i64, Node>) {
+#[derive(Clone, Copy, Debug)]
+struct GeoCoordinate {
+    pub longitude: f64,
+    pub latitude: f64,
+}
+
+impl From<Point<f64>> for GeoCoordinate {
+    fn from(value: Point<f64>) -> Self {
+        Self {
+            longitude: value.x,
+            latitude: value.y,
+        }
+    }
+}
+
+impl From<Coord<f64>> for GeoCoordinate {
+    fn from(value: Coord<f64>) -> Self {
+        Self {
+            longitude: value.x,
+            latitude: value.y,
+        }
+    }
+}
+
+impl From<GeoCoordinate> for Coord<f64> {
+    fn from(value: GeoCoordinate) -> Self {
+        Coord {
+            x: value.longitude,
+            y: value.latitude,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ImageCache {
+    tiles: HashMap<Tile, DynamicImage>,
+    outlines: HashMap<Tile, ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
+    dirty: HashSet<Tile>,
+}
+
+impl ImageCache {
+    pub fn prepare_tile(&mut self, tile: Tile) -> anyhow::Result<()> {
+        let interest_center = (54.6961, 20.5120);
+        let interest_zoom = ZOOM - 4; // 4096 area
+        let interest_megatile =
+            slippy_map_tiles::lat_lon_to_tile(interest_center.0, interest_center.1, interest_zoom);
+        let interest_megatile =
+            Tile::new(interest_zoom, interest_megatile.0, interest_megatile.1).unwrap();
+
+        let do_download = {
+            let mut t = tile;
+            while t.zoom() > interest_megatile.zoom() {
+                t = t.parent().unwrap();
+            }
+            t == interest_megatile
+        };
+
+        if self.tiles.get(&tile).is_none() && !do_download {
+            anyhow::bail!("Missing tile, and not downloading it");
+        }
+
+        if let (Some(_a), Some(_b)) = (self.tiles.get_mut(&tile), self.outlines.get_mut(&tile)) {
+            return Ok(());
+        }
+
+        info!("Preparing tile {tile:?}");
+
+        assert_eq!(tile.zoom(), ZOOM);
+
+        let path = format!("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{}/{}/{}", tile.zoom(), tile.y(), tile.x());
+        //let path = format!("https://core-sat.maps.yandex.net/tiles?l=sat&v=3.1124.0&x={}&y={}&z={}&scale=1&lang=ru_RU&client_id=yandex-web-maps", tile.x(), tile.y(), tile.zoom());
+
+        let tiledata = reqwest::blocking::get(path)
+            .unwrap()
+            .bytes()
+            .unwrap()
+            .to_vec();
+        let tileimg = image::io::Reader::new(Cursor::new(tiledata))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        let outline_img: ImageBuffer<image::Rgb<u8>, Vec<_>> =
+            ImageBuffer::new(tileimg.width(), tileimg.height());
+        self.tiles.insert(tile, tileimg);
+        self.outlines.insert(tile, outline_img);
+
+        Ok(())
+    }
+
+    pub fn geo_to_screen_coordinate(
+        tile: Tile,
+        screen_size: (u32, u32),
+        coord: GeoCoordinate,
+    ) -> Point<i32> {
+        let top_lat = tile.top() as f64;
+        let bot_lat = tile.bottom() as f64;
+        // let (min_lat, max_lat) = (min_lat.min(max_lat), max_lat.max(min_lat));
+        let left_lon = tile.left() as f64;
+        let right_lon = tile.right() as f64;
+        // let (min_lon, max_lon) = (min_lon.min(max_lon), max_lon.max(min_lon));
+
+        let x = translate(
+            coord.longitude,
+            left_lon,
+            right_lon,
+            0.0,
+            screen_size.0 as f64,
+        ) as i32;
+        let y = translate(coord.latitude, top_lat, bot_lat, 0.0, screen_size.1 as f64) as i32;
+        // NOTE: latitude is vertical coordinate, +Y is down
+        // longitude is horizontal coordinate, and +X is right
+
+        // println!("{lon_px} {lat_px}");
+        Point::new(x, y)
+    }
+
+    pub fn draw_polygon(&mut self, poly: &[GeoCoordinate]) -> anyhow::Result<()> {
+        info!("Drawing polygon {poly:?}");
+
+        let tiles: HashSet<_> = poly
+            .iter()
+            .map(|v| {
+                let c =
+                    slippy_map_tiles::lat_lon_to_tile(v.latitude as f32, v.longitude as f32, ZOOM);
+                Tile::new(ZOOM, c.0, c.1).unwrap()
+            })
+            .collect();
+
+        for tile in tiles {
+            debug!("Polygon is included in: {tile:?}");
+            self.dirty.insert(tile);
+            self.prepare_tile(tile)?;
+            let img = self.outlines.get_mut(&tile).unwrap();
+            let screen_size = (img.width(), img.height());
+
+            let mut tile_relative_poly: Vec<_> = poly
+                .iter()
+                .map(|c| Self::geo_to_screen_coordinate(tile, screen_size, *c))
+                .collect();
+            while tile_relative_poly.last().unwrap() == tile_relative_poly.first().unwrap() {
+                tile_relative_poly.pop().unwrap();
+            }
+            imageproc::drawing::draw_polygon_mut(
+                img,
+                &tile_relative_poly,
+                image::Rgb([0u8, 255, 0]),
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn save(&mut self) {
+        warn!("Saving image cache...");
+        for (tile, img) in self.tiles.iter().filter(|v| self.dirty.contains(v.0)) {
+            img.save(format!("tiles/{}-{}.jpg", tile.y(), tile.x()))
+                .unwrap();
+        }
+        for (tile, img) in self.outlines.iter().filter(|v| self.dirty.contains(v.0)) {
+            img.save(format!("outlines/{}-{}.png", tile.y(), tile.x()))
+                .unwrap();
+        }
+        self.dirty.clear();
+    }
+
+    pub fn load() -> Self {
+        warn!("Loading image cache...");
+        let mut cache = Self::default();
+
+        for name in std::fs::read_dir("tiles").unwrap() {
+            let name = name.unwrap();
+            let name = name.file_name();
+            let name = name.to_string_lossy();
+            let img = image::io::Reader::open(format!("tiles/{name}"))
+                .unwrap()
+                .decode()
+                .unwrap();
+            let mut parts = name.strip_suffix(".jpg").unwrap().split("-");
+            let y = parts.next().unwrap().parse().unwrap();
+            let x = parts.next().unwrap().parse().unwrap();
+            let tile = Tile::new(ZOOM, x, y).unwrap();
+            cache.tiles.insert(tile, img);
+        }
+        for name in std::fs::read_dir("outlines").unwrap() {
+            let name = name.unwrap();
+            let name = name.file_name();
+            let name = name.to_string_lossy();
+            let img = image::io::Reader::open(format!("outlines/{name}"))
+                .unwrap()
+                .decode()
+                .unwrap();
+            let mut parts = name.strip_suffix(".png").unwrap().split("-");
+            let y = parts.next().unwrap().parse().unwrap();
+            let x = parts.next().unwrap().parse().unwrap();
+            let tile = Tile::new(ZOOM, x, y).unwrap();
+            cache.outlines.insert(tile, img.into_rgb8());
+        }
+
+        info!(
+            "Loaded {} tiles and {} outlines",
+            cache.tiles.len(),
+            cache.outlines.len()
+        );
+
+        cache
+    }
+}
+
+fn fetch_outline_way(
+    cache: &mut ImageCache,
+    way: &Way,
+    nodes: &HashMap<i64, Node>,
+) -> anyhow::Result<()> {
     if way.nodes.len() < 3 {
-        println!("This way has less than 3 nodes, ignoring");
-        return;
+        info!("This way has less than 3 nodes, ignoring");
+        return Ok(());
     }
     let nodes: Vec<_> = way.nodes.iter().map(|v| nodes.get(&v.0)).collect();
     if !nodes.iter().all(|v| v.is_some()) {
-        println!("This way does not have all nodes available");
-        return;
+        warn!("This way does not have all nodes available");
+        return Ok(());
     }
     let coords: Vec<_> = nodes
         .iter()
         .map(|v| v.unwrap())
-        .map(|n| {
-            (
-                (n.decimicro_lat as f64) / 10_000_000.0,
-                (n.decimicro_lon as f64) / 10_000_000.0,
-            )
+        .map(|n| GeoCoordinate {
+            longitude: (n.decimicro_lon as f64) / 10_000_000.0,
+            latitude: (n.decimicro_lat as f64) / 10_000_000.0,
         })
         .collect();
 
     let geo_poly = Polygon::new(
-        LineString::new(
-            coords
-                .iter()
-                .cloned()
-                .map(|(x, y)| Coord { x, y })
-                .collect(),
-        ),
+        LineString::new(coords.iter().map(|v| (*v).into()).collect()),
         vec![],
     );
-    let area = geo_poly.geodesic_area_unsigned();
-    println!("Area: {area} m^2");
-    if area < 10.0 {
-        println!("Area too small, ignoring");
-        return;
+    let area = geo_poly.geodesic_area_signed().abs();
+    info!("Area: {area} m^2");
+    if area < 100.0 {
+        info!("Area too small, ignoring");
+        return Ok(());
     }
 
-    let min_lat = coords
-        .iter()
-        .map(|v| v.0)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-    let min_lon = coords
-        .iter()
-        .map(|v| v.1)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-    let max_lat = coords
-        .iter()
-        .map(|v| v.0)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-    let max_lon = coords
-        .iter()
-        .map(|v| v.1)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-
-    let min = LatLon::new(min_lat as f32, min_lon as f32).unwrap();
-    let max = LatLon::new(max_lat as f32, max_lon as f32).unwrap();
-    if min.tile(ZOOM) != max.tile(ZOOM) {
-        println!("Building does not fit in one tile");
-    }
-    let tile = min.tile(ZOOM);
-    let path = format!("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{}/{}/{}", tile.zoom(), tile.y(), tile.x());
-    //let path = format!("https://core-sat.maps.yandex.net/tiles?l=sat&v=3.1124.0&x={}&y={}&z={}&scale=1&lang=ru_RU&client_id=yandex-web-maps", tile.x(), tile.y(), tile.zoom());
-    println!("Building in tile: {path}");
-
-    let mut poly = vec![];
-    for coord in coords.iter() {
-        println!("{coord:?}");
-        let min_lat = tile.top() as f64;
-        let max_lat = tile.bottom() as f64;
-        let (min_lat, max_lat) = (min_lat.min(max_lat), max_lat.max(min_lat));
-        let min_lon = tile.left() as f64;
-        let max_lon = tile.right() as f64;
-        let (min_lon, max_lon) = (min_lon.min(max_lon), max_lon.max(min_lon));
-
-        let lon_px = translate(coord.0, min_lat, max_lat, 0.0, 255.0) as i32;
-        let lat_px = translate(coord.1, min_lon, max_lon, 0.0, 255.0) as i32;
-        poly.push(Point::new(lon_px, lat_px));
-    }
-    poly.pop();
-
-    let tiledata = reqwest::blocking::get(path)
-        .unwrap()
-        .bytes()
-        .unwrap()
-        .to_vec();
-    //    let mut img = ImageBuffer::new(256, 256);
-    let mut img = image::io::Reader::new(Cursor::new(tiledata))
-        .with_guessed_format()
-        .unwrap()
-        .decode()
-        .unwrap();
-
-    let mut poly = vec![];
-    for coord in coords.iter() {
-        let min_lat = tile.top() as f64;
-        let max_lat = tile.bottom() as f64;
-        let (max_lat, min_lat) = (min_lat.min(max_lat), max_lat.max(min_lat));
-        let min_lon = tile.left() as f64;
-        let max_lon = tile.right() as f64;
-        let (min_lon, max_lon) = (min_lon.min(max_lon), max_lon.max(min_lon));
-
-        let lon_px = translate(coord.0, min_lat, max_lat, 0.0, 255.0) as i32;
-        let lat_px = translate(coord.1, min_lon, max_lon, 0.0, 255.0) as i32;
-        poly.push(Point::new(lat_px, lon_px));
-    }
-    poly.pop();
-
-    imageproc::drawing::draw_polygon_mut(&mut img, &poly, image::Rgba([0u8, 255, 0, 128]));
-
-    img.save(format!("way-{}-{}-{}.png", way.id.0, tile.y(), tile.x()))
-        .unwrap();
+    cache.draw_polygon(&coords)?;
+    Ok(())
 }
 
-fn fetch_outline_relation(rel: &Relation, nodes: &HashMap<i64, Node>, ways: &HashMap<i64, Way>) {
+fn fetch_outline_relation(
+    cache: &mut ImageCache,
+    rel: &Relation,
+    nodes: &HashMap<i64, Node>,
+    ways: &HashMap<i64, Way>,
+) -> anyhow::Result<()> {
     println!("{rel:?}");
     for wayref in rel.refs.iter().filter(|v| v.member.is_way()) {
         println!("Has wayref: {wayref:?}");
         let wayid = wayref.member.inner_id();
         if let Some(way) = ways.get(&wayid) {
             println!("Found way: {way:?}");
-            fetch_outline_way(way, nodes);
+            fetch_outline_way(cache, way, nodes)?;
         } else {
             println!("This way not found");
         }
     }
+    Ok(())
 }
 
 fn build_outlines(filename: &std::ffi::OsStr) {
@@ -256,12 +396,28 @@ fn build_outlines(filename: &std::ffi::OsStr) {
             }
         }
     }
-    println!("Loaded!");
+    println!("Loading imgs...");
+    let mut cache = ImageCache::load();
+    println!("Done!");
 
-    for way in ways_buildings.iter().take(10) {
-        println!("{way:?}");
-        fetch_outline_way(way.1, &nodes_all);
+    let mut idx = 0;
+    for way in ways_buildings.iter().progress_with_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
+        )
+        .unwrap(),
+    ) {
+        info!("{way:?}");
+        idx += 1;
+        if let Err(why) = fetch_outline_way(&mut cache, way.1, &nodes_all) {
+            info!("error fetching outline: {why}")
+        };
+        if idx % 100 == 0 {
+            cache.save();
+        }
     }
+
+    cache.save();
 
     // for rel in relations_buildings.iter().take(50) {
     //     println!("------------");

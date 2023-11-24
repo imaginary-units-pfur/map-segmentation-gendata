@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./stitch_pictures/Cargo.toml"
+    ]
+}
