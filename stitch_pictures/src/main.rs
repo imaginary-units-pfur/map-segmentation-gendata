@@ -20,7 +20,7 @@ fn get_outline(t: Tile) -> Option<DynamicImage> {
         .ok()
 }
 
-fn build_tile_img(tile: &Tile) {
+fn build_tile_img(tile: &Tile) -> bool {
     let mut target_tile = RgbImage::new(256 * 8, 256 * 8);
     let mut target_outline = RgbImage::new(256 * 8, 256 * 8);
     for x in 0..8 {
@@ -35,7 +35,10 @@ fn build_tile_img(tile: &Tile) {
                         img.height() as i64 * y as i64,
                     );
                 }
-                None => return,
+                None => {
+                    println!("{tile:?} cannot render: {t:?}: no tile");
+                    return false;
+                }
             };
 
             match get_outline(t) {
@@ -47,7 +50,10 @@ fn build_tile_img(tile: &Tile) {
                         img.height() as i64 * y as i64,
                     );
                 }
-                None => return,
+                None => {
+                    println!("{tile:?} cannot render: {t:?}: no outline");
+                    return false;
+                }
             };
         }
     }
@@ -62,6 +68,8 @@ fn build_tile_img(tile: &Tile) {
             tile.x()
         ))
         .unwrap();
+
+    true
 }
 
 fn main() {
@@ -72,12 +80,10 @@ fn main() {
         .map(|v| v.unwrap().file_name().to_string_lossy().to_string())
         .collect::<Vec<_>>();
     files.sort();
-    for name in files.into_iter()
-        .progress_with_style(ProgressStyle::with_template(
-            "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
-        )
-        .unwrap())
-    {
+
+    let mut all_tiles = vec![];
+
+    for name in files.into_iter() {
         // let img = image::io::Reader::open(format!("tiles/{name}"))
         //     .unwrap()
         //     .decode()
@@ -86,13 +92,34 @@ fn main() {
         let y = parts.next().unwrap().parse().unwrap();
         let x = parts.next().unwrap().parse().unwrap();
         let tile = Tile::new(ZOOM, x, y).unwrap();
+        all_tiles.push(tile);
+    }
+
+    println!("{}", all_tiles.len());
+
+    let mut ok = 0;
+    let mut fail = 0;
+
+    all_tiles.sort_by_key(|v| (v.x(), v.y()));
+    for tile in all_tiles.into_iter().progress_with_style(ProgressStyle::with_template(
+        "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
+    )
+    .unwrap())
+    {
+        if tile.x() % 8 != 0 {continue;}
+        if tile.y() % 8 != 0 {continue;}
         if !tiles_touched.contains(&tile) {
-            build_tile_img(&tile);
+            if build_tile_img(&tile) {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
             for dx in 0..8 {
                 for dy in 0..8 {
-                    tiles_touched.insert(Tile::new(ZOOM, x + dx, y + dy).unwrap());
+                    tiles_touched.insert(Tile::new(ZOOM, tile.x() + dx, tile.y() + dy).unwrap());
                 }
             }
         }
     }
+    println!("OK: {ok}, error: {fail}");
 }

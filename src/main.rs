@@ -11,7 +11,7 @@ use imageproc::point::Point;
 use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use log::{debug, info, warn};
 use osmpbfreader::{Node, Relation, Way};
-use slippy_map_tiles::{LatLon, Tile};
+use slippy_map_tiles::{lat_lon_to_tile, zorder_to_xy, BBox, LatLon, Tile};
 
 struct ProgressFile<R: std::io::Read> {
     inner: R,
@@ -157,7 +157,8 @@ impl ImageCache {
 
         // entire moscow
         let buf = 0.5;
-        let interest_bbox = slippy_map_tiles::BBox::new(55.93+buf, 37.3-buf, 55.56-buf, 37.9+buf).unwrap();
+        let interest_bbox =
+            slippy_map_tiles::BBox::new(55.93 + buf, 37.3 - buf, 55.56 - buf, 37.9 + buf).unwrap();
 
         // inside TTK
         // let interest_bbox = slippy_map_tiles::BBox::new(55.79, 37.53, 55.70, 37.7).unwrap();
@@ -307,7 +308,12 @@ impl ImageCache {
             let tile = Tile::new(ZOOM, x, y).unwrap();
             cache.tiles.insert(tile, ());
         }
-        for name in std::fs::read_dir("outlines").unwrap() {
+        for name in std::fs::read_dir("outlines").unwrap().collect::<Vec<_>>().into_iter().progress_with_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
+                )
+                .unwrap(),
+            ) {
             let name = name.unwrap();
             let name = name.file_name();
             let name = name.to_string_lossy();
@@ -369,91 +375,136 @@ fn fetch_outline_way(
     Ok(())
 }
 
-fn fetch_outline_relation(
-    cache: &mut ImageCache,
-    rel: &Relation,
-    nodes: &HashMap<i64, Node>,
-    ways: &HashMap<i64, Way>,
-) -> anyhow::Result<()> {
-    println!("{rel:?}");
-    for wayref in rel.refs.iter().filter(|v| v.member.is_way()) {
-        println!("Has wayref: {wayref:?}");
-        let wayid = wayref.member.inner_id();
-        if let Some(way) = ways.get(&wayid) {
-            println!("Found way: {way:?}");
-            fetch_outline_way(cache, way, nodes)?;
-        } else {
-            println!("This way not found");
-        }
-    }
-    Ok(())
-}
-
 fn build_outlines(filename: &std::ffi::OsStr) {
     println!("Loading...");
-    let r = std::fs::File::open(&std::path::Path::new(filename)).unwrap();
-    let len = r.metadata().unwrap().len();
-    let r = ProgressFile::new(r, len);
-    let mut pbf = osmpbfreader::OsmPbfReader::new(r);
+    // let r = std::fs::File::open(&std::path::Path::new(filename)).unwrap();
+    // let len = r.metadata().unwrap().len();
+    // let r = ProgressFile::new(r, len);
+    // let mut pbf = osmpbfreader::OsmPbfReader::new(r);
 
-    let mut nodes_all = HashMap::new();
-    let mut nodes_only_buildings = HashMap::new();
-    let mut ways_all = HashMap::new();
-    let mut ways_buildings = HashMap::new();
-    let mut relations_buildings = HashMap::new();
+    // let mut nodes_all = HashMap::new();
+    // let mut nodes_only_buildings = HashMap::new();
+    // let mut ways_all = HashMap::new();
+    // let mut ways_buildings = HashMap::new();
+    // let mut relations_buildings = HashMap::new();
 
-    for obj in pbf.par_iter().map(Result::unwrap) {
-        let is_building = obj.tags().contains_key("building");
-        match obj {
-            osmpbfreader::OsmObj::Node(node) => {
-                if is_building {
-                    nodes_only_buildings.insert(node.id.0, node.clone());
-                }
-                nodes_all.insert(node.id.0, node);
-            }
-            osmpbfreader::OsmObj::Way(way) => {
-                if is_building {
-                    ways_buildings.insert(way.id.0, way.clone());
-                }
-                ways_all.insert(way.id.0, way);
-            }
-            osmpbfreader::OsmObj::Relation(rel) => {
-                if is_building {
-                    relations_buildings.insert(rel.id.0, rel);
-                }
-            }
-        }
-    }
+    // for obj in pbf.par_iter().map(Result::unwrap) {
+    //     let is_building = obj.tags().contains_key("building");
+    //     match obj {
+    //         osmpbfreader::OsmObj::Node(node) => {
+    //             if is_building {
+    //                 nodes_only_buildings.insert(node.id.0, node.clone());
+    //             }
+    //             nodes_all.insert(node.id.0, node);
+    //         }
+    //         osmpbfreader::OsmObj::Way(way) => {
+    //             if is_building {
+    //                 ways_buildings.insert(way.id.0, way.clone());
+    //             }
+    //             ways_all.insert(way.id.0, way);
+    //         }
+    //         osmpbfreader::OsmObj::Relation(rel) => {
+    //             if is_building {
+    //                 relations_buildings.insert(rel.id.0, rel);
+    //             }
+    //         }
+    //     }
+    // }
     println!("Loading imgs...");
-    let mut cache = ImageCache::load();
+    // let mut cache = ImageCache::load();
     println!("Done!");
 
-    let mut idx = 0;
-    for way in ways_buildings.iter().progress_with_style(
+    let client = reqwest::blocking::Client::new();
+
+    let mut tiles = HashSet::new();
+    for name in std::fs::read_dir("tiles").unwrap().collect::<Vec<_>>().into_iter().progress_with_style(
         ProgressStyle::with_template(
             "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
         )
         .unwrap(),
     ) {
-        let mut interest_tags = String::new();
-        for tag in way.1.tags.iter() {
-            if tag.0.starts_with("building") {
-                let part = format!("{}={}; ", tag.0, tag.1);
-                interest_tags.extend(part.chars());
-            }
+    let name = name.unwrap();
+    let name = name.file_name();
+    let name = name.to_string_lossy();
+    // let img = image::io::Reader::open(format!("outlines/{name}"))
+    //     .unwrap()
+    //     .decode()
+    //     .unwrap();
+    let mut parts = name.strip_suffix(".jpg").unwrap().split("-");
+    let y = parts.next().unwrap().parse().unwrap();
+    let x = parts.next().unwrap().parse().unwrap();
+    let tile = Tile::new(ZOOM, x, y).unwrap();
+    tiles.insert(tile);
+}
+
+    let mut download_tile = |tile: Tile| {
+        if tiles.contains(&tile) {
+            return;
         }
-        // info!("{way:?}");
-        // println!("{interest_tags}");
-        idx += 1;
-        if let Err(why) = fetch_outline_way(&mut cache, way.1, &nodes_all) {
-            info!("error fetching outline: {why}")
-        };
-        if idx % 100 == 0 {
-            cache.save();
-        }
+        let path = format!("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{}/{}/{}", tile.zoom(), tile.y(), tile.x());
+        //let path = format!("https://core-sat.maps.yandex.net/tiles?l=sat&v=3.1124.0&x={}&y={}&z={}&scale=1&lang=ru_RU&client_id=yandex-web-maps", tile.x(), tile.y(), tile.zoom());
+
+        let tiledata = client.get(path).send().unwrap().bytes().unwrap().to_vec();
+        let tileimg = image::io::Reader::new(Cursor::new(tiledata))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        tileimg
+            .save(format!("tiles/{}-{}.jpg", tile.y(), tile.x()))
+            .unwrap();
+        tiles.insert(tile);
+    };
+
+    let buf = 0.5;
+    let interest_bbox =
+        slippy_map_tiles::BBox::new(55.93 + buf, 37.3 - buf, 55.56 - buf, 37.9 + buf).unwrap();
+
+    let iter = interest_bbox.tiles_for_zoom(ZOOM);
+
+    let top_left_tile = lat_lon_to_tile(interest_bbox.top(), interest_bbox.left(), ZOOM);
+    let bottom_right_tile = lat_lon_to_tile(interest_bbox.bottom(), interest_bbox.right(), ZOOM);
+
+    let count = (bottom_right_tile.0 - top_left_tile.0) * (bottom_right_tile.1 - top_left_tile.1);
+
+    let style = ProgressStyle::with_template(
+        "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
+    )
+    .unwrap();
+
+    for tile in iter.progress_count(count as u64).with_style(style) {
+        download_tile(tile);
+        // cache.prepare_tile(tile).unwrap();
+        // cache.save();
     }
 
-    cache.save();
+    // let mut idx = 0;
+    // for way in ways_buildings.iter().progress_with_style(
+    //     ProgressStyle::with_template(
+    //         "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
+    //     )
+    //     .unwrap(),
+    // ) {
+    //     let mut interest_tags = String::new();
+    //     for tag in way.1.tags.iter() {
+    //         if tag.0.starts_with("building") {
+    //             let part = format!("{}={}; ", tag.0, tag.1);
+    //             interest_tags.extend(part.chars());
+    //         }
+    //     }
+    //     // info!("{way:?}");
+    //     // println!("{interest_tags}");
+    //     idx += 1;
+    //     if let Err(why) = fetch_outline_way(&mut cache, way.1, &nodes_all) {
+    //         info!("error fetching outline: {why}")
+    //     };
+    //     if idx % 100 == 0 {
+    //         cache.save();
+    //     }
+    // }
+
+    // cache.save();
 
     // for rel in relations_buildings.iter().take(50) {
     //     println!("------------");
