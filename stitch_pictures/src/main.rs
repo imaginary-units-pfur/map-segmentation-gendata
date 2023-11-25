@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::mpsc, thread::spawn};
 
 use image::{DynamicImage, RgbImage};
-use indicatif::{ProgressIterator, ProgressStyle};
+use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use slippy_map_tiles::Tile;
 
 const ZOOM: u8 = 17; // zoom where 1px=1m;
@@ -21,6 +22,13 @@ fn get_outline(t: Tile) -> Option<DynamicImage> {
 }
 
 fn build_tile_img(tile: &Tile) -> bool {
+    if std::fs::OpenOptions::new()
+        .open(format!("../stitched/tiles/{}-{}.jpg", tile.y(), tile.x()))
+        .is_ok()
+    {
+        return true; // already exists
+    }
+
     let mut target_tile = RgbImage::new(256 * 8, 256 * 8);
     let mut target_outline = RgbImage::new(256 * 8, 256 * 8);
     for x in 0..8 {
@@ -51,8 +59,21 @@ fn build_tile_img(tile: &Tile) -> bool {
                     );
                 }
                 None => {
-                    println!("{tile:?} cannot render: {t:?}: no outline");
-                    return false;
+                    let mut error = RgbImage::new(256, 256);
+                    error.chunks_exact_mut(3).for_each(|v| {
+                        v[0] = 0;
+                        v[1] = 0;
+                        v[2] = 255;
+                    });
+                    image::imageops::overlay(
+                        &mut target_outline,
+                        &error,
+                        error.width() as i64 * x as i64,
+                        error.height() as i64 * y as i64,
+                    );
+
+                    // println!("{tile:?} cannot render: {t:?}: no outline");
+                    // return false;
                 }
             };
         }
@@ -100,26 +121,53 @@ fn main() {
     let mut ok = 0;
     let mut fail = 0;
 
-    all_tiles.sort_by_key(|v| (v.x(), v.y()));
-    for tile in all_tiles.into_iter().progress_with_style(ProgressStyle::with_template(
+    let style = ProgressStyle::with_template(
         "[{elapsed_precise}->{eta_precise}] {bar:100} [{human_pos}/{human_len} {percent}% {per_sec}]",
     )
-    .unwrap())
-    {
-        if tile.x() % 8 != 0 {continue;}
-        if tile.y() % 8 != 0 {continue;}
-        if !tiles_touched.contains(&tile) {
+    .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(100);
+
+    enum Request {
+        Contains(Tile, mpsc::SyncSender<bool>),
+        Add(Tile),
+    }
+
+    spawn(move || loop {
+        let req: Request = rx.recv().unwrap();
+        match req {
+            Request::Contains(tile, tx) => tx.send(tiles_touched.contains(&tile)).unwrap(),
+            Request::Add(tile) => {
+                tiles_touched.insert(tile);
+            }
+        }
+    });
+
+    let pb = ProgressBar::new(all_tiles.len() as u64).with_style(style);
+    all_tiles.sort_by_key(|v| (v.x(), v.y()));
+    all_tiles.par_iter().for_each(|tile| {
+        pb.inc(1);
+        if tile.x() % 8 != 0 {
+            return;
+        }
+        if tile.y() % 8 != 0 {
+            return;
+        }
+        let (my_tx, my_rx) = mpsc::sync_channel(1);
+        tx.send(Request::Contains(*tile, my_tx)).unwrap();
+
+        if !my_rx.recv().unwrap() {
             if build_tile_img(&tile) {
-                ok += 1;
             } else {
-                fail += 1;
             }
             for dx in 0..8 {
                 for dy in 0..8 {
-                    tiles_touched.insert(Tile::new(ZOOM, tile.x() + dx, tile.y() + dy).unwrap());
+                    tx.send(Request::Add(
+                        Tile::new(ZOOM, tile.x() + dx, tile.y() + dy).unwrap(),
+                    ))
+                    .unwrap();
                 }
             }
         }
-    }
-    println!("OK: {ok}, error: {fail}");
+    });
 }

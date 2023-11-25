@@ -900,6 +900,7 @@ dependencies = [
  "log",
  "osmpbfreader",
  "postcard",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",
@@ -1746,6 +1747,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "indicatif",
+ "rayon",
  "slippy-map-tiles",
 ]
 

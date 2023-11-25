@@ -11,6 +11,7 @@ use imageproc::point::Point;
 use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use log::{debug, info, warn};
 use osmpbfreader::{Node, Relation, Way};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use slippy_map_tiles::{lat_lon_to_tile, zorder_to_xy, BBox, LatLon, Tile};
 
 struct ProgressFile<R: std::io::Read> {
@@ -437,7 +438,7 @@ fn build_outlines(filename: &std::ffi::OsStr) {
     tiles.insert(tile);
 }
 
-    let mut download_tile = |tile: Tile| {
+    let download_tile = |tile: Tile| {
         if tiles.contains(&tile) {
             return;
         }
@@ -454,14 +455,30 @@ fn build_outlines(filename: &std::ffi::OsStr) {
         tileimg
             .save(format!("tiles/{}-{}.jpg", tile.y(), tile.x()))
             .unwrap();
-        tiles.insert(tile);
     };
 
     let buf = 0.5;
     let interest_bbox =
         slippy_map_tiles::BBox::new(55.93 + buf, 37.3 - buf, 55.56 - buf, 37.9 + buf).unwrap();
 
-    let iter = interest_bbox.tiles_for_zoom(ZOOM);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(256)
+        .build_global()
+        .unwrap();
+    let iter = {
+        let top_left_tile = lat_lon_to_tile(interest_bbox.top(), interest_bbox.left(), ZOOM);
+        let bottom_right_tile =
+            lat_lon_to_tile(interest_bbox.bottom(), interest_bbox.right(), ZOOM);
+
+        (top_left_tile.0..=bottom_right_tile.0)
+            .into_par_iter()
+            .flat_map(move |x| {
+                (top_left_tile.1..=bottom_right_tile.1)
+                    .into_par_iter()
+                    .map(move |y| (x, y))
+            })
+            .map(move |(x, y)| Tile::new(ZOOM, x, y).unwrap())
+    };
 
     let top_left_tile = lat_lon_to_tile(interest_bbox.top(), interest_bbox.left(), ZOOM);
     let bottom_right_tile = lat_lon_to_tile(interest_bbox.bottom(), interest_bbox.right(), ZOOM);
@@ -473,11 +490,12 @@ fn build_outlines(filename: &std::ffi::OsStr) {
     )
     .unwrap();
 
-    for tile in iter.progress_count(count as u64).with_style(style) {
-        download_tile(tile);
-        // cache.prepare_tile(tile).unwrap();
-        // cache.save();
-    }
+    let pb = ProgressBar::new(count as u64).with_style(style);
+
+    iter.for_each(|v| {
+        download_tile(v);
+        pb.inc(1);
+    });
 
     // let mut idx = 0;
     // for way in ways_buildings.iter().progress_with_style(
